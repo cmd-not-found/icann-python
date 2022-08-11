@@ -1,154 +1,155 @@
-import json
+import os
 import sys
 import cgi
-import os
+import json
+import boto3
 import datetime
+import requests
+from multiprocessing import Pool, cpu_count
 
-from do_authentication import authenticate
-from do_http_get import do_get
+class ICANN:
 
-##############################################################################################################
-# First Step: Get the config data from config.json file
-##############################################################################################################
+    def __init__(self, access_token=None):
+        self.access_token = access_token
+        self.auth_url = "https://account-api.icann.org/api/authenticate"
+        self.czds_base_url = "https://czds-api.icann.org"
+        self.username = ''
+        self.password = ''
+        self.working_directory = '.'
+        self.headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
 
-try:
-    if 'CZDS_CONFIG' in os.environ:
-        config_data = os.environ['CZDS_CONFIG']
-        config = json.loads(config_data)
-    else:
-        config_file = open("config.json", "r")
-        config = json.load(config_file)
-        config_file.close()
-except:
-    sys.stderr.write("Error loading config.json file.\n")
-    exit(1)
+    def _http_req(self, method, url):
 
-# The config.json file must contain the following data:
-username = config['icann.account.username']
-password = config['icann.account.password']
-authen_base_url = config['authentication.base.url']
-czds_base_url = config['czds.base.url']
+        headers = self.headers
+        headers['Authorization'] = 'Bearer {0}'.format(self.access_token)
 
-# This is optional. Default to current directory
-working_directory = config.get('working.directory', '.') # Default to current directory
+        resp = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            stream=True
+        )
 
-if not username:
-    sys.stderr.write("'icann.account.username' parameter not found in the config.json file\n")
-    exit(1)
-
-if not password:
-    sys.stderr.write("'icann.account.password' parameter not found in the config.json file\n")
-    exit(1)
-
-if not authen_base_url:
-    sys.stderr.write("'authentication.base.url' parameter not found in the config.json file\n")
-    exit(1)
-
-if not czds_base_url:
-    sys.stderr.write("'czds.base.url' parameter not found in the config.json file\n")
-    exit(1)
+        return resp
 
 
-
-##############################################################################################################
-# Second Step: authenticate the user to get an access_token.
-# Note that the access_token is global for all the REST API calls afterwards
-##############################################################################################################
-
-print("Authenticate user {0}".format(username))
-access_token = authenticate(username, password, authen_base_url)
+    def _get_aws_tokens(self):
+        session = boto3.Session(region_name='us-east-2')
+        ssm = session.client('ssm')
+        self.password = ssm.get_parameter(Name='czds_password', WithDecryption=True)['Parameter']['Value']
+        self.username = ssm.get_parameter(Name='czds_username')['Parameter']['Value']
 
 
+    def _authenticate(self):
 
-##############################################################################################################
-# Third Step: Get the download zone file links
-##############################################################################################################
+        self._get_aws_tokens()
+        creds = {
+            "username": self.username,
+            "password": self.password
+        }
 
-# Function definition for listing the zone links
-def get_zone_links(czds_base_url):
-    global  access_token
-
-    links_url = czds_base_url + "/czds/downloads/links"
-    links_response = do_get(links_url, access_token)
-
-    status_code = links_response.status_code
-
-    if status_code == 200:
-        zone_links = links_response.json()
-        print("{0}: The number of zone files to be downloaded is {1}".format(datetime.datetime.now(),len(zone_links)))
-        return zone_links
-    elif status_code == 401:
-        print("The access_token has been expired. Re-authenticate user {0}".format(username))
-        access_token = authenticate(username, password, authen_base_url)
-        get_zone_links(czds_base_url)
-    else:
-        sys.stderr.write("Failed to get zone links from {0} with error code {1}\n".format(links_url, status_code))
-        return None
-
-
-# Get the zone links
-zone_links = get_zone_links(czds_base_url)
-if not zone_links:
-    exit(1)
+        resp = requests.post(self.auth_url, data=json.dumps(creds), headers=self.headers)
+        # Return the access_token on status code 200. Otherwise, terminate the program.
+        if resp.status_code == 200:
+            self.access_token = resp.json()['accessToken']
+        elif resp.status_code == 404:
+            sys.stderr.write("Invalid url " + self.auth_url)
+            exit(1)
+        elif resp.status_code == 401:
+            sys.stderr.write("Invalid username/password. Please reset your password via web")
+            exit(1)
+        elif resp.status_code == 500:
+            sys.stderr.write("Internal server error. Please try again later")
+            exit(1)
+        else:
+            sys.stderr.write("Failed to authenticate user {0} with error code {1}".format(self.username, resp.status_code))
+            exit(1)
 
 
+    def get_zone_links(self):
 
-##############################################################################################################
-# Fourth Step: download zone files
-##############################################################################################################
+        links_url = self.czds_base_url + "/czds/downloads/links"
+        resp = self._http_req('GET', links_url)
 
-# Function definition to download one zone file
-def download_one_zone(url, output_directory):
-    print("{0}: Downloading zone file from {1}".format(str(datetime.datetime.now()), url))
+        if resp.status_code == 200:
+            zone_links = resp.json()
+            print("{0}: The number of zone files to be downloaded is {1}".format(datetime.datetime.now(),len(zone_links)))
+            return zone_links
+        elif resp.status_code == 401:
+            print("The access_token has been expired. Re-authenticate user {0}".format(self.username))
+            self._authenticate()
+            self.get_zone_links()
+        else:
+            sys.stderr.write("Failed to get zone links from {0} with error code {1}\n".format(links_url, resp.status_code))
+            return None
 
-    global  access_token
-    download_zone_response = do_get(url, access_token)
+    def download_one_zone(self, url):
 
-    status_code = download_zone_response.status_code
+        output_directory = self.working_directory + "/zonefiles"
+        print("{0}: Downloading zone file from {1}".format(str(datetime.datetime.now()), url))
+        resp = self._http_req('GET', url)
 
-    if status_code == 200:
-        # Try to get the filename from the header
-        _,option = cgi.parse_header(download_zone_response.headers['content-disposition'])
-        filename = option.get('filename')
+        if resp.status_code == 200:
+            # Try to get the filename from the header
+            _,option = cgi.parse_header(resp.headers['content-disposition'])
+            filename = option.get('filename')
 
-        # If could get a filename from the header, then makeup one like [tld].txt.gz
-        if not filename:
-            filename = url.rsplit('/', 1)[-1].rsplit('.')[-2] + '.txt.gz'
+            # If get a filename from the header, then makeup one like [tld].txt.gz
+            if not filename:
+                filename = url.rsplit('/', 1)[-1].rsplit('.')[-2] + '.txt.gz'
 
-        # This is where the zone file will be saved
-        path = '{0}/{1}'.format(output_directory, filename)
+            # This is where the zone file will be saved
+            path = '{0}/{1}'.format(output_directory, filename)
 
-        with open(path, 'wb') as f:
-            for chunk in download_zone_response.iter_content(1024):
-                f.write(chunk)
+            with open(path, 'wb') as f:
+                for chunk in resp.iter_content(1024):
+                    f.write(chunk)
 
-        print("{0}: Completed downloading zone to file {1}".format(str(datetime.datetime.now()), path))
+            print("{0}: Completed downloading zone to file {1}".format(str(datetime.datetime.now()), path))
 
-    elif status_code == 401:
-        print("The access_token has been expired. Re-authenticate user {0}".format(username))
-        access_token = authenticate(username, password, authen_base_url)
-        download_one_zone(url, output_directory)
-    elif status_code == 404:
-        print("No zone file found for {0}".format(url))
-    else:
-        sys.stderr.write('Failed to download zone from {0} with code {1}\n'.format(url, status_code))
+        elif resp.status_code == 401:
+            print("The access_token has been expired. Re-authenticate user {0}".format(username))
+            self._authenticate()
+            self.download_one_zone(url)
+        elif resp.status_code == 404:
+            print("No zone file found for {0}".format(url))
+        else:
+            sys.stderr.write('Failed to download zone from {0} with code {1}\n'.format(url, status_code))
 
-# Function definition for downloading all the zone files
-def download_zone_files(urls, working_directory):
+    # Function definition for downloading all the zone files
+    def download_zone_files(self, urls):
 
-    # The zone files will be saved in a sub-directory
-    output_directory = working_directory + "/zonefiles"
+        # The zone files will be saved in a sub-directory
+        output_directory = self.working_directory + "/zonefiles"
 
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory)
 
-    # Download the zone files one by one
-    for link in urls:
-        download_one_zone(link, output_directory)
+        # Download the zone files one by one
+        #for link in urls:
+            #self.download_one_zone(link, output_directory)
+        
+        pool = Pool(cpu_count())
+        pool.map(self.download_one_zone, urls)
+        pool.close()
+        pool.join()
 
-# Finally, download all zone files
-start_time = datetime.datetime.now()
-download_zone_files(zone_links, working_directory)
-end_time = datetime.datetime.now()
 
-print("{0}: DONE DONE. Completed downloading all zone files. Time spent: {1}".format(str(end_time), (end_time-start_time)))
+
+def main():
+
+    client = ICANN()
+    client._authenticate()
+    links = client.get_zone_links()
+    start_time = datetime.datetime.now()
+    client.download_zone_files(links)
+    end_time = datetime.datetime.now()
+
+    print("{0}: DONE DONE. Completed downloading all zone files. Time spent: {1}".format(str(end_time), (end_time-start_time)))
+
+
+if __name__ == "__main__":
+    main()
