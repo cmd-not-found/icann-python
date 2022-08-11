@@ -5,7 +5,7 @@ import json
 import boto3
 import datetime
 import requests
-from multiprocessing import Pool, cpu_count
+import threading
 
 class ICANN:
 
@@ -131,13 +131,18 @@ class ICANN:
         # Download the zone files one by one
         #for link in urls:
             #self.download_one_zone(link, output_directory)
+
+        threads=[]
+        for i in range(len(urls)):
+            while True:
+                if threading.activeCount() <= 10:
+                    t1 = threading.Thread(target=self.download_one_zone, args=[urls[i]])
+                    t1.start()
+                    threads.append(t1)
+                    break
         
-        pool = Pool(cpu_count())
-        pool.map(self.download_one_zone, urls)
-        pool.close()
-        pool.join()
-
-
+        for thread in threads:
+            thread.join()
 
 def main():
 
